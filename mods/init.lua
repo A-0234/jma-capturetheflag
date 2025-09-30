@@ -1,122 +1,189 @@
-local INVIS_DURATION = 10
-local BUBBLE_INTERVAL = 0.2
-local POTION_COOLDOWN = 60
-local invisible_players = {}
-local last_drink_time = {}
 
-core.register_craftitem("invis_potion:potion", {
-    description = "Invisible Potion",
-    inventory_image = "invis_potion.png",
-    on_use = function(itemstack, user, pointed_thing)
-        if not user or not user:is_player() then return end
-        local name = user:get_player_name()
+local storage = core.get_mod_storage()
+local cooldowns = {}
+local flying = {}
+local sword_entities = {}
 
-        local now = os.time()
-        if last_drink_time[name] and now - last_drink_time[name] < POTION_COOLDOWN then
-            local remaining = POTION_COOLDOWN - (now - last_drink_time[name])
-            core.chat_send_player(name, "Potion is on cooldown! Wait " .. remaining .. " seconds.")
-            return itemstack
-        end
+local FLY_TIME = 4
+local FALL_IMMUNITY = 2
+local FLY_COOLDOWN = 120  -- right-click fly cooldown in seconds
 
-        if core.get_modpath("ctf") and ctf_flag and ctf_flag.player_has_flag(name) then
-            core.chat_send_player(name, "You cannot drink while carrying a flag!")
-            return itemstack
-        end
-
-        if core.get_modpath("ctf_combat") and ctf_combat.in_combat(name) then
-            core.chat_send_player(name, "You cannot drink while in combat!")
-            return itemstack
-        end
-
-        user:set_properties({
-            visual_size = {x = 0, y = 0},
-            makes_footstep_sound = false
-        })
-        user:set_observers({})
-        invisible_players[name] = {
-            time_left = INVIS_DURATION,
-            bubble_timer = 0
-        }
-
-        last_drink_time[name] = now
-        itemstack:take_item()
-        core.chat_send_player(name, "You are invisible now!")
-
-        return itemstack
-    end,
+core.register_privilege("antifall", {
+    description = "No fall damage",
+    give_to_singleplayer = false,
 })
 
-core.register_globalstep(function(dtime)
-    for name, data in pairs(invisible_players) do
-        local player = core.get_player_by_name(name)
-        if not player then
-            invisible_players[name] = nil
-        else
-            data.time_left = data.time_left - dtime
-            data.bubble_timer = data.bubble_timer + dtime
-
-            if data.bubble_timer >= BUBBLE_INTERVAL then
-                data.bubble_timer = 0
-                local pos = player:get_pos()
-                local offset = {
-                    x = math.random(-5, 5) * 0.1,
-                    y = math.random(0, 15) * 0.1,
-                    z = math.random(-5, 5) * 0.1
-                }
-                core.add_particle({
-                    pos = {x=pos.x+offset.x, y=pos.y+1+offset.y, z=pos.z+offset.z},
-                    velocity = {x=0, y=0.5, z=0},
-                    expirationtime = 1,
-                    size = 2,
-                    texture = "bubble.png",
-                    glow = 5
-                })
-            end
-
-            if data.time_left <= 0 then
-                player:set_properties({
-                    visual_size = {x = 1, y = 1},
-                    makes_footstep_sound = true
-                })
-                player:set_observers(nil)
-                invisible_players[name] = nil
-                core.chat_send_player(name, "You are now visible again!")
-            end
-        end
-    end
-end)
-
-core.register_on_punchplayer(function(player, hitter)
-    if hitter and hitter:is_player() then
-        local name = hitter:get_player_name()
-        if invisible_players[name] then
-            return true
-        end
-    end
-end)
-
 core.register_on_player_hpchange(function(player, hp_change, reason)
-    if hp_change < 0 and reason.type == "punch" then
+    if reason.type == "fall" then
         local name = player:get_player_name()
-        if invisible_players[name] then
+        local privs = core.get_player_privs(name)
+        if privs and privs.antifall then
             return 0
         end
     end
     return hp_change
 end, true)
 
-if core.get_modpath("ctf") then
-    ctf.register_on_capture(function(flag, player)
-        if not player or not player:is_player() then return end
-        local name = player:get_player_name()
-        if invisible_players[name] then
-            player:set_properties({
-                visual_size = {x = 1, y = 1},
-                makes_footstep_sound = true
-            })
-            player:set_observers(nil)
-            invisible_players[name] = nil
-            core.chat_send_player(name, "You became visible after capturing the flag!")
+core.register_entity("swordfly:flying_sword", {
+    initial_properties = {
+        physical = false,
+        collide_with_objects = false,
+        pointable = false,
+        visual = "wielditem",
+        visual_size = {x=1, y=1},
+        textures = {"swordfly:sword_of_wind"},
+    },
+
+    on_step = function(self, dtime)
+        local pos = self.object:get_pos()
+        if not pos then return end
+        local objects = core.get_objects_inside_radius(pos, 2)
+        local player_near = false
+        for _, obj in ipairs(objects) do
+            if obj:is_player() then
+                player_near = true
+                break
+            end
         end
-    end)
-end
+        if not player_near then
+            self.object:remove()
+        end
+    end,
+})
+
+core.register_on_joinplayer(function(player)
+    local name = player:get_player_name()
+    local val = storage:get_int("cd_" .. name)
+    if val and val > 0 then
+        cooldowns[name] = val
+    end
+end)
+
+core.register_on_leaveplayer(function(player)
+    local name = player:get_player_name()
+    local privs = core.get_player_privs(name)
+    if privs then
+        privs.fly = nil
+        privs.antifall = nil
+        core.set_player_privs(name, privs)
+    end
+    if sword_entities[name] then
+        local ent = sword_entities[name]
+        if ent and ent:get_luaentity() then
+            ent:remove()
+        end
+        sword_entities[name] = nil
+    end
+    if cooldowns[name] then
+        storage:set_int("cd_" .. name, cooldowns[name])
+    end
+    flying[name] = nil
+end)
+
+core.register_on_prejoinplayer(function(name, ip)
+    if flying[name] then
+        return "You cannot log out while flying on the Sword of Wind."
+    end
+end)
+
+core.register_tool("swordfly:sword_of_wind", {
+    description = "Sword of Wind (right-click to ground to fly)",
+    inventory_image = "sword_of_winds.png",
+    tool_capabilities = {
+        full_punch_interval = 0.8,  -- left-click interval 0.8s
+        max_drop_level = 1,
+        groupcaps = {
+            snappy = {times = {[1]=0.8, [2]=0.8, [3]=0.8}, uses=30, maxlevel=2},
+        },
+        damage_groups = {fleshy=5},
+    },
+
+    on_place = function(itemstack, user, pointed_thing)
+        local name = user:get_player_name()
+        if not name then return itemstack end
+
+        local now = core.get_gametime()
+        if cooldowns[name] and cooldowns[name] > now then
+            local left = cooldowns[name] - now
+            core.chat_send_player(name, string.format("Sword fly is recharging (%.0f s left)", left))
+            return itemstack
+        end
+
+        if flying[name] then
+            core.chat_send_player(name, "You are already flying on the Sword of Wind!")
+            return itemstack
+        end
+
+        local privs = core.get_player_privs(name)
+        if not privs then privs = {} end
+        privs.fly = true
+        core.set_player_privs(name, privs)
+
+        core.chat_send_player(name, "You are flying on the Sword of Wind for " .. FLY_TIME .. " seconds.")
+        flying[name] = true
+
+        local pos = user:get_pos()
+        local sword_entity = core.add_entity({x=pos.x, y=pos.y-5, z=pos.z}, "swordfly:flying_sword")
+        if sword_entity then
+            sword_entity:set_attach(user, "", {x=0, y=-5, z=0}, {x=0, y=0, z=0})
+            sword_entities[name] = sword_entity
+        end
+
+        local remaining = FLY_TIME
+        local function countdown()
+            if remaining > 0 then
+                if remaining <= 3 then
+                    core.chat_send_player(name, "Flight ends in " .. remaining .. "s...")
+                end
+                remaining = remaining - 1
+                core.after(1, countdown)
+            end
+        end
+        core.after(1, countdown)
+
+        core.after(FLY_TIME + 1, function()
+            local privs2 = core.get_player_privs(name) or {}
+            privs2.fly = nil
+            privs2.antifall = true
+            core.set_player_privs(name, privs2)
+
+            local player_obj = core.get_player_by_name(name)
+            if player_obj then
+                core.chat_send_player(name, "Sword power faded. Safe landing for " .. FALL_IMMUNITY .. " seconds.")
+            end
+
+            core.after(FALL_IMMUNITY, function()
+                local privs3 = core.get_player_privs(name) or {}
+                privs3.antifall = nil
+                core.set_player_privs(name, privs3)
+                local p = core.get_player_by_name(name)
+                if p then
+                    core.chat_send_player(name, "Safe landing effect ended.")
+                end
+            end)
+
+            if sword_entities[name] then
+                local ent = sword_entities[name]
+                if ent and ent:get_luaentity() then
+                    ent:remove()
+                end
+                sword_entities[name] = nil
+            end
+
+            flying[name] = nil
+            cooldowns[name] = core.get_gametime() + FLY_COOLDOWN  -- 120s right-click cooldown
+            storage:set_int("cd_" .. name, cooldowns[name])
+        end)
+
+        return itemstack
+    end,
+})
+
+core.register_craft({
+    output = "swordfly:sword_of_wind",
+    recipe = {
+        {"", "default:diamond", ""},
+        {"default:diamond", "default:diamond", "default:diamond"},
+        {"", "default:diamond", ""},
+    }
+})

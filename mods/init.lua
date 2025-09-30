@@ -1,189 +1,116 @@
 
-local storage = core.get_mod_storage()
-local cooldowns = {}
-local flying = {}
-local sword_entities = {}
-
-local FLY_TIME = 4
-local FALL_IMMUNITY = 2
-local FLY_COOLDOWN = 120  -- right-click fly cooldown in seconds
-
-core.register_privilege("antifall", {
-    description = "No fall damage",
-    give_to_singleplayer = false,
+minetest.register_node("nightvision:glow_effect", {
+    description = "Night Vision Glow",
+    drawtype = "airlike",
+    light_source = 14,
+    walkable = false,
+    pointable = false,
+    diggable = false,
+    buildable_to = true,
+    groups = {not_in_creative_inventory = 1},
 })
 
-core.register_on_player_hpchange(function(player, hp_change, reason)
-    if reason.type == "fall" then
-        local name = player:get_player_name()
-        local privs = core.get_player_privs(name)
-        if privs and privs.antifall then
-            return 0
-        end
-    end
-    return hp_change
-end, true)
 
-core.register_entity("swordfly:flying_sword", {
-    initial_properties = {
-        physical = false,
-        collide_with_objects = false,
-        pointable = false,
-        visual = "wielditem",
-        visual_size = {x=1, y=1},
-        textures = {"swordfly:sword_of_wind"},
-    },
+local cooldown_time = 300
 
-    on_step = function(self, dtime)
-        local pos = self.object:get_pos()
-        if not pos then return end
-        local objects = core.get_objects_inside_radius(pos, 2)
-        local player_near = false
-        for _, obj in ipairs(objects) do
-            if obj:is_player() then
-                player_near = true
-                break
-            end
-        end
-        if not player_near then
-            self.object:remove()
-        end
-    end,
-})
 
-core.register_on_joinplayer(function(player)
-    local name = player:get_player_name()
-    local val = storage:get_int("cd_" .. name)
-    if val and val > 0 then
-        cooldowns[name] = val
-    end
-end)
+nightvision_last_use = nightvision_last_use or {}
+nightvision_active = nightvision_active or {}
 
-core.register_on_leaveplayer(function(player)
-    local name = player:get_player_name()
-    local privs = core.get_player_privs(name)
-    if privs then
-        privs.fly = nil
-        privs.antifall = nil
-        core.set_player_privs(name, privs)
-    end
-    if sword_entities[name] then
-        local ent = sword_entities[name]
-        if ent and ent:get_luaentity() then
-            ent:remove()
-        end
-        sword_entities[name] = nil
-    end
-    if cooldowns[name] then
-        storage:set_int("cd_" .. name, cooldowns[name])
-    end
-    flying[name] = nil
-end)
 
-core.register_on_prejoinplayer(function(name, ip)
-    if flying[name] then
-        return "You cannot log out while flying on the Sword of Wind."
-    end
-end)
+local warning_times = {30, 20, 10, 5, 4, 3, 2, 1}
 
-core.register_tool("swordfly:sword_of_wind", {
-    description = "Sword of Wind (right-click to ground to fly)",
-    inventory_image = "sword_of_winds.png",
-    tool_capabilities = {
-        full_punch_interval = 0.8,  -- left-click interval 0.8s
-        max_drop_level = 1,
-        groupcaps = {
-            snappy = {times = {[1]=0.8, [2]=0.8, [3]=0.8}, uses=30, maxlevel=2},
-        },
-        damage_groups = {fleshy=5},
-    },
+minetest.register_craftitem("nightvision:night_vision_potion", {
+    description = "Night Vision Potion",
+    inventory_image = "nightvision_potion.png",
+    groups = {food = 1},  -- shows in creative inventory
+    on_use = function(itemstack, user, pointed_thing)
+        local player_name = user:get_player_name()
 
-    on_place = function(itemstack, user, pointed_thing)
-        local name = user:get_player_name()
-        if not name then return itemstack end
 
-        local now = core.get_gametime()
-        if cooldowns[name] and cooldowns[name] > now then
-            local left = cooldowns[name] - now
-            core.chat_send_player(name, string.format("Sword fly is recharging (%.0f s left)", left))
+        local last_use = nightvision_last_use[player_name] or 0
+        local now = os.time()
+        if now - last_use < cooldown_time then
+            local remain = cooldown_time - (now - last_use)
+            minetest.chat_send_player(player_name, math.ceil(remain) .. " seconds cooldown left")
             return itemstack
         end
 
-        if flying[name] then
-            core.chat_send_player(name, "You are already flying on the Sword of Wind!")
-            return itemstack
-        end
+        nightvision_last_use[player_name] = now
 
-        local privs = core.get_player_privs(name)
-        if not privs then privs = {} end
-        privs.fly = true
-        core.set_player_privs(name, privs)
 
-        core.chat_send_player(name, "You are flying on the Sword of Wind for " .. FLY_TIME .. " seconds.")
-        flying[name] = true
+        local radius = 20
+        local duration = 60
+        local glow_nodes = {}
 
-        local pos = user:get_pos()
-        local sword_entity = core.add_entity({x=pos.x, y=pos.y-5, z=pos.z}, "swordfly:flying_sword")
-        if sword_entity then
-            sword_entity:set_attach(user, "", {x=0, y=-5, z=0}, {x=0, y=0, z=0})
-            sword_entities[name] = sword_entity
-        end
+        nightvision_active[player_name] = {
+            player = user,
+            glow_nodes = glow_nodes,
+            timer = 0,
+            duration = duration,
+            radius = radius,
+            warned_times = {}
+        }
 
-        local remaining = FLY_TIME
-        local function countdown()
-            if remaining > 0 then
-                if remaining <= 3 then
-                    core.chat_send_player(name, "Flight ends in " .. remaining .. "s...")
-                end
-                remaining = remaining - 1
-                core.after(1, countdown)
-            end
-        end
-        core.after(1, countdown)
 
-        core.after(FLY_TIME + 1, function()
-            local privs2 = core.get_player_privs(name) or {}
-            privs2.fly = nil
-            privs2.antifall = true
-            core.set_player_privs(name, privs2)
-
-            local player_obj = core.get_player_by_name(name)
-            if player_obj then
-                core.chat_send_player(name, "Sword power faded. Safe landing for " .. FALL_IMMUNITY .. " seconds.")
-            end
-
-            core.after(FALL_IMMUNITY, function()
-                local privs3 = core.get_player_privs(name) or {}
-                privs3.antifall = nil
-                core.set_player_privs(name, privs3)
-                local p = core.get_player_by_name(name)
-                if p then
-                    core.chat_send_player(name, "Safe landing effect ended.")
-                end
-            end)
-
-            if sword_entities[name] then
-                local ent = sword_entities[name]
-                if ent and ent:get_luaentity() then
-                    ent:remove()
-                end
-                sword_entities[name] = nil
-            end
-
-            flying[name] = nil
-            cooldowns[name] = core.get_gametime() + FLY_COOLDOWN  -- 120s right-click cooldown
-            storage:set_int("cd_" .. name, cooldowns[name])
-        end)
-
+        itemstack:take_item()
+        minetest.chat_send_player(player_name, "Night Vision activated!")
         return itemstack
     end,
 })
 
-core.register_craft({
-    output = "swordfly:sword_of_wind",
-    recipe = {
-        {"", "default:diamond", ""},
-        {"default:diamond", "default:diamond", "default:diamond"},
-        {"", "default:diamond", ""},
-    }
-})
+minetest.register_globalstep(function(dtime)
+    for player_name, data in pairs(nightvision_active) do
+        data.timer = data.timer + dtime
+        data.duration = data.duration - dtime
+
+        local pos = data.player:get_pos()
+
+
+        if data.duration <= 0 then
+            for _, p in ipairs(data.glow_nodes) do
+                if minetest.get_node(p).name == "nightvision:glow_effect" then
+                    minetest.set_node(p, {name="air"})
+                end
+            end
+
+            minetest.chat_send_player(player_name, "Night Vision potion is expired!")
+
+            nightvision_active[player_name] = nil
+        else
+
+            if data.timer >= 0.5 then
+                data.timer = 0
+
+                for _, p in ipairs(data.glow_nodes) do
+                    if minetest.get_node(p).name == "nightvision:glow_effect" then
+                        minetest.set_node(p, {name="air"})
+                    end
+                end
+                data.glow_nodes = {}
+
+                local radius = data.radius
+                for x = -radius, radius, 4 do
+                    for y = -radius, radius, 4 do
+                        for z = -radius, radius, 4 do
+                            if x*x + y*y + z*z <= radius*radius then
+                                local p = {x=pos.x+x, y=pos.y+y, z=pos.z+z}
+                                if minetest.get_node(p).name == "air" then
+                                    minetest.set_node(p, {name="nightvision:glow_effect"})
+                                    table.insert(data.glow_nodes, p)
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+
+            for _, t in ipairs(warning_times) do
+                if data.duration <= t and not data.warned_times[t] then
+                    minetest.chat_send_player(player_name, t .. " seconds left")
+                    data.warned_times[t] = true
+                end
+            end
+        end
+    end
+end)
